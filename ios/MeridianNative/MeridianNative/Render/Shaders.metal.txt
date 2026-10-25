@@ -1,0 +1,479 @@
+// Metal port of every shader the web original renders with: three.js MeshLambertMaterial (r172 lighting,
+// PCF-soft shadows, sRGB output) extended by the game's mist / grading / cutaway code, MeshBasicMaterial,
+// sprites, points and the custom ShaderMaterials (sky, water, waterfall, banner, mist layers, beam).
+// The colour pipeline is reproduced exactly: lighting in linear space, conversion to sRGB in the shader,
+// blending on the encoded values (non-sRGB render target), as WebGL does.
+
+#include <metal_stdlib>
+using namespace metal;
+
+struct VertexIn {
+    packed_float3 position;
+    packed_float3 normal;
+    packed_float2 uv;
+    float mist;
+};
+
+struct FrameU {
+    float4x4 viewProj;
+    float4x4 view;
+    float4x4 proj;
+    float4x4 shadowVP;
+    float4 sunDir;
+    float4 sunColor;
+    float4 hemiSky;
+    float4 hemiGround;
+    float4 fogColor;
+    float4 fog;        // x low, y high, z time, w shadows on
+    float4 foci[6];
+    float4 rimColor;   // w = number of foci
+    float4 focus;
+    float4 viewDir;
+    float4 viewport;   // x, y drawable size in px, z point scale
+    float4 skyTop;
+    float4 skyBottom;
+    float4 skyGlow;
+    float4 skyParams;  // aspect, bright, shift, lift
+};
+
+struct DrawU {
+    float4x4 model;
+    float4x4 normalMat;
+    float4 color;      // linear rgb, a = opacity
+    float4 glowColor;  // linear rgb, w = glow
+    float4 params;     // x cut, y flags, z phase, w extra
+    float4 extra;
+    float4 extra2;
+};
+
+constant int FLAG_MAP = 1;
+constant int FLAG_FLAT = 2;
+constant int FLAG_SHADOW = 4;
+
+// GLSL smoothstep semantics, valid for reversed edges too.
+inline float ss(float e0, float e1, float x) {
+    float t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+inline float3 srgbOETF(float3 v) {
+    float3 hi = pow(max(v, 0.0), float3(0.41666)) * 1.055 - 0.055;
+    float3 lo = v * 12.92;
+    return select(hi, lo, v <= 0.0031308);
+}
+
+inline float fractf(float x) { return x - floor(x); }
+
+// ───────────────────────── lit (MeshLambertMaterial + onBeforeCompile) ─────────────────────────
+
+struct LitOut {
+    float4 position [[position]];
+    float3 wpos;
+    float3 normal;
+    float2 uv;
+    float mist;
+    float4 shadowCoord;
+};
+
+vertex LitOut vs_lit(uint vid [[vertex_id]],
+                     const device VertexIn *verts [[buffer(0)]],
+                     constant FrameU &F [[buffer(1)]],
+                     constant DrawU &D [[buffer(2)]]) {
+    VertexIn v = verts[vid];
+    float4 world = D.model * float4(float3(v.position), 1.0);
+    LitOut o;
+    o.position = F.viewProj * world;
+    o.wpos = world.xyz;
+    float3 n = normalize((D.normalMat * float4(float3(v.normal), 0.0)).xyz);
+    o.normal = n;
+    o.uv = float2(v.uv);
+    o.mist = v.mist;
+    // normal bias 0.02 along the world normal, as shadowmap_vertex does
+    o.shadowCoord = F.shadowVP * (world + float4(n * 0.02, 0.0));
+    return o;
+}
+
+inline float shadowCompare(depth2d<float> map, sampler s, float2 uv, float z) {
+    return step(z, map.sample(s, uv));
+}
+
+// getShadow() for SHADOWMAP_TYPE_PCF_SOFT with bias −0.0006.
+inline float pcfSoft(depth2d<float> map, sampler s, float4 sc, float2 size) {
+    float3 c = sc.xyz / sc.w;
+    float2 uvc = float2(c.x * 0.5 + 0.5, 0.5 - c.y * 0.5);
+    float z = c.z - 0.0006;
+    bool inFrustum = uvc.x >= 0.0 && uvc.x <= 1.0 && uvc.y >= 0.0 && uvc.y <= 1.0;
+    if (!(inFrustum && z <= 1.0)) return 1.0;
+    float2 texel = 1.0 / size;
+    float dx = texel.x, dy = texel.y;
+    float2 f = fract(uvc * size + 0.5);
+    float2 uv = uvc - f * texel;
+    float sh =
+        shadowCompare(map, s, uv, z) +
+        shadowCompare(map, s, uv + float2(dx, 0.0), z) +
+        shadowCompare(map, s, uv + float2(0.0, dy), z) +
+        shadowCompare(map, s, uv + texel, z) +
+        mix(shadowCompare(map, s, uv + float2(-dx, 0.0), z), shadowCompare(map, s, uv + float2(2.0 * dx, 0.0), z), f.x) +
+        mix(shadowCompare(map, s, uv + float2(-dx, dy), z), shadowCompare(map, s, uv + float2(2.0 * dx, dy), z), f.x) +
+        mix(shadowCompare(map, s, uv + float2(0.0, -dy), z), shadowCompare(map, s, uv + float2(0.0, 2.0 * dy), z), f.y) +
+        mix(shadowCompare(map, s, uv + float2(dx, -dy), z), shadowCompare(map, s, uv + float2(dx, 2.0 * dy), z), f.y) +
+        mix(mix(shadowCompare(map, s, uv + float2(-dx, -dy), z), shadowCompare(map, s, uv + float2(2.0 * dx, -dy), z), f.x),
+            mix(shadowCompare(map, s, uv + float2(-dx, 2.0 * dy), z), shadowCompare(map, s, uv + float2(2.0 * dx, 2.0 * dy), z), f.x),
+            f.y);
+    return sh * (1.0 / 9.0);
+}
+
+fragment float4 fs_lit(LitOut in [[stage_in]],
+                       constant FrameU &F [[buffer(1)]],
+                       constant DrawU &D [[buffer(2)]],
+                       texture2d<float> map [[texture(0)]],
+                       depth2d<float> shadowMap [[texture(1)]],
+                       sampler mapSampler [[sampler(0)]],
+                       sampler shadowSampler [[sampler(1)]]) {
+    int flags = int(D.params.y);
+    float3 diffuse = D.color.rgb;
+    float alpha = D.color.a;
+    if (flags & FLAG_MAP) {
+        float4 t = map.sample(mapSampler, in.uv);
+        diffuse *= t.rgb;
+        alpha *= t.a;
+    }
+    float3 N;
+    if (flags & FLAG_FLAT) {
+        // three: normalize(cross(dFdx(p), dFdy(p))) with GL's upward window y
+        N = normalize(cross(dfdy(in.wpos), dfdx(in.wpos)));
+    } else {
+        N = normalize(in.normal);
+    }
+    float shadow = 1.0;
+    if ((flags & FLAG_SHADOW) && F.fog.w > 0.5) {
+        shadow = pcfSoft(shadowMap, shadowSampler, in.shadowCoord, float2(shadowMap.get_width(), shadowMap.get_height()));
+    }
+    float dotNL = saturate(dot(N, F.sunDir.xyz));
+    float3 irradiance = dotNL * F.sunColor.rgb * shadow;
+    float3 hemi = mix(F.hemiGround.rgb, F.hemiSky.rgb, 0.5 * N.y + 0.5);
+    float3 outgoing = (irradiance + hemi) * (diffuse * (1.0 / M_PI_F));
+    float3 c = srgbOETF(outgoing);
+
+    // ── custom code, injected after the colour space conversion ──
+    c = mix(c, D.glowColor.rgb, D.glowColor.w);
+    c *= mix(0.955, 1.03, ss(-4.0, 22.0, in.wpos.y));
+    float behind = dot(F.focus.xyz - in.wpos, F.viewDir.xyz);
+    float aerial = ss(5.0, 30.0, behind) * (0.42 + 0.58 * in.mist);
+    float mist = max(max(in.mist * 0.6, aerial), 1.0 - ss(F.fog.x, F.fog.y, in.wpos.y));
+    c = mix(c, F.fogColor.rgb, mist * mist * (3.0 - 2.0 * mist));
+    float cut = D.params.x;
+    if (cut > 0.001) {
+        float2 frag = float2(in.position.x, F.viewport.y - in.position.y);
+        float m = 1.0;
+        float grain = fractf(sin(dot(floor(frag * 0.5), float2(12.9898, 78.233))) * 43758.5453) - 0.5;
+        int n = int(F.rimColor.w);
+        for (int i = 0; i < 6; i++) {
+            if (i >= n) break;
+            float3 f = F.foci[i].xyz;
+            float r = f.z * (0.55 + 0.45 * cut);
+            float d = distance(frag, f.xy) + grain * r * 0.05;
+            m = min(m, ss(r * 0.5, r, d));
+        }
+        float rim = ss(0.0, 0.5, m) * ss(1.0, 0.5, m);
+        c = mix(c, F.rimColor.rgb, rim * 0.35 * cut);
+        float a = mix(1.0, m, cut);
+        if (a < 0.03) discard_fragment();
+        alpha *= a;
+    }
+    return float4(c, alpha);
+}
+
+// ───────────────────────── basic (MeshBasicMaterial) ─────────────────────────
+
+struct BasicOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex BasicOut vs_basic(uint vid [[vertex_id]],
+                         const device VertexIn *verts [[buffer(0)]],
+                         constant FrameU &F [[buffer(1)]],
+                         constant DrawU &D [[buffer(2)]]) {
+    VertexIn v = verts[vid];
+    BasicOut o;
+    o.position = F.viewProj * (D.model * float4(float3(v.position), 1.0));
+    o.uv = float2(v.uv);
+    return o;
+}
+
+fragment float4 fs_basic(BasicOut in [[stage_in]],
+                         constant DrawU &D [[buffer(2)]],
+                         texture2d<float> map [[texture(0)]],
+                         sampler mapSampler [[sampler(0)]]) {
+    float4 c = D.color;
+    if (int(D.params.y) & FLAG_MAP) c *= map.sample(mapSampler, in.uv);
+    return float4(srgbOETF(c.rgb), c.a);
+}
+
+// ───────────────────────── sprites ─────────────────────────
+
+vertex BasicOut vs_sprite(uint vid [[vertex_id]],
+                          constant FrameU &F [[buffer(1)]],
+                          constant DrawU &D [[buffer(2)]]) {
+    const float2 corners[6] = { float2(-0.5, -0.5), float2(0.5, -0.5), float2(0.5, 0.5), float2(-0.5, -0.5), float2(0.5, 0.5), float2(-0.5, 0.5) };
+    float2 p = corners[vid];
+    float4 mv = F.view * (D.model * float4(0.0, 0.0, 0.0, 1.0));
+    float2 scale = float2(length(D.model[0].xyz), length(D.model[1].xyz));
+    mv.xy += p * scale;
+    BasicOut o;
+    o.position = F.proj * mv;
+    o.uv = p + 0.5;
+    return o;
+}
+
+// ───────────────────────── points ─────────────────────────
+
+struct PointIn {
+    packed_float3 position;
+};
+
+struct PointOut {
+    float4 position [[position]];
+    float size [[point_size]];
+};
+
+vertex PointOut vs_points(uint vid [[vertex_id]],
+                          const device PointIn *pts [[buffer(0)]],
+                          constant FrameU &F [[buffer(1)]],
+                          constant DrawU &D [[buffer(2)]]) {
+    PointOut o;
+    o.position = F.viewProj * (D.model * float4(float3(pts[vid].position), 1.0));
+    // params.w = 1: size in world units (soft motes at full resolution); otherwise device-independent pixels
+    o.size = max(1.0, D.params.z * (D.params.w > 0.5 ? F.viewport.w : F.viewport.z));
+    return o;
+}
+
+fragment float4 fs_points(PointOut in [[stage_in]],
+                          float2 pc [[point_coord]],
+                          constant DrawU &D [[buffer(2)]],
+                          texture2d<float> map [[texture(0)]],
+                          sampler mapSampler [[sampler(0)]]) {
+    float4 c = D.color;
+    if (int(D.params.y) & FLAG_MAP) c *= map.sample(mapSampler, float2(pc.x, 1.0 - pc.y));
+    return float4(srgbOETF(c.rgb), c.a);
+}
+
+// ───────────────────────── depth-only shadow pass ─────────────────────────
+
+vertex float4 vs_shadow(uint vid [[vertex_id]],
+                        const device VertexIn *verts [[buffer(0)]],
+                        constant FrameU &F [[buffer(1)]],
+                        constant DrawU &D [[buffer(2)]]) {
+    return F.shadowVP * (D.model * float4(float3(verts[vid].position), 1.0));
+}
+
+// ───────────────────────── custom materials ─────────────────────────
+
+struct WorldOut {
+    float4 position [[position]];
+    float3 w;
+    float2 uv;
+    float shade;
+};
+
+vertex WorldOut vs_world(uint vid [[vertex_id]],
+                         const device VertexIn *verts [[buffer(0)]],
+                         constant FrameU &F [[buffer(1)]],
+                         constant DrawU &D [[buffer(2)]]) {
+    VertexIn v = verts[vid];
+    float4 w = D.model * float4(float3(v.position), 1.0);
+    WorldOut o;
+    o.position = F.viewProj * w;
+    o.w = w.xyz;
+    o.uv = float2(v.uv);
+    o.shade = 1.0;
+    return o;
+}
+
+fragment float4 fs_water(WorldOut in [[stage_in]], constant FrameU &F [[buffer(1)]], constant DrawU &D [[buffer(2)]]) {
+    float t = F.fog.z;
+    float r = sin(in.w.x * 3.1 + t * 0.9) * sin(in.w.z * 2.7 - t * 0.7);
+    float band = sin((in.w.x - in.w.z) * 5.0 + t * 1.3 + r * 1.8);
+    float lines = ss(0.93, 1.0, band);
+    float3 c = mix(D.extra.rgb, D.extra2.rgb, 0.55 + 0.25 * r);
+    c += float3(lines) * 0.18;
+    return float4(srgbOETF(c), 1.0);
+}
+
+inline float hfall(float n) { return fractf(sin(n) * 43758.5453); }
+
+fragment float4 fs_fall(WorldOut in [[stage_in]], constant FrameU &F [[buffer(1)]], constant DrawU &D [[buffer(2)]]) {
+    float t = F.fog.z;
+    float col = floor(in.uv.x * 9.0);
+    float speed = 1.6 + hfall(col) * 0.8;
+    float s = fractf(in.w.y * 0.9 + t * speed + hfall(col * 7.0));
+    float streak = ss(0.0, 0.25, s) * ss(1.0, 0.55, s);
+    float edge = ss(0.0, 0.12, in.uv.x) * ss(1.0, 0.88, in.uv.x);
+    float3 c = mix(D.extra2.rgb, D.extra.rgb, streak);
+    float a = (0.55 + 0.4 * streak) * edge;
+    float mist = 1.0 - ss(F.fog.x, F.fog.y, in.w.y);
+    c = mix(c, F.fogColor.rgb, mist);
+    a *= 1.0 - mist * 0.85;
+    return float4(srgbOETF(c), a);
+}
+
+vertex WorldOut vs_banner(uint vid [[vertex_id]],
+                          const device VertexIn *verts [[buffer(0)]],
+                          constant FrameU &F [[buffer(1)]],
+                          constant DrawU &D [[buffer(2)]]) {
+    VertexIn v = verts[vid];
+    float t = F.fog.z;
+    float phase = D.params.z;
+    float2 uv = float2(v.uv);
+    float3 p = float3(v.position);
+    float freeEnd = 1.0 - uv.y;
+    float wave = sin(uv.y * 5.0 - t * 1.6 + phase) * 0.07 * freeEnd + sin(uv.x * 3.0 + t * 2.2 + phase) * 0.015 * freeEnd;
+    p.z += wave;
+    float4 w = D.model * float4(p, 1.0);
+    WorldOut o;
+    o.position = F.viewProj * w;
+    o.w = w.xyz;
+    o.uv = uv;
+    o.shade = 0.86 + 0.14 * cos(uv.y * 5.0 - t * 1.6 + phase);
+    return o;
+}
+
+fragment float4 fs_banner(WorldOut in [[stage_in]], constant FrameU &F [[buffer(1)]], constant DrawU &D [[buffer(2)]]) {
+    float notch = 0.14 * (1.0 - abs(in.uv.x - 0.5) * 2.0);
+    if (in.uv.y < notch) discard_fragment();
+    float3 c = D.color.rgb;
+    float border = step(in.uv.x, 0.09) + step(0.91, in.uv.x) + step(0.93, in.uv.y);
+    c = mix(c, D.extra.rgb, clamp(border, 0.0, 1.0) * 0.85);
+    float2 q = float2((in.uv.x - 0.5) * 1.0, (in.uv.y - 0.62) * 0.35);
+    c = mix(c, D.extra2.rgb, ss(0.13, 0.11, length(q)));
+    c *= in.shade;
+    float mist = 1.0 - ss(F.fog.x, F.fog.y, in.w.y);
+    c = mix(c, F.fogColor.rgb, mist);
+    return float4(srgbOETF(c), 1.0);
+}
+
+inline float vnoise(float2 p) {
+    float2 i = floor(p);
+    float2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = fractf(sin(dot(i, float2(127.1, 311.7))) * 43758.5453);
+    float b = fractf(sin(dot(i + float2(1, 0), float2(127.1, 311.7))) * 43758.5453);
+    float c = fractf(sin(dot(i + float2(0, 1), float2(127.1, 311.7))) * 43758.5453);
+    float d = fractf(sin(dot(i + float2(1, 1), float2(127.1, 311.7))) * 43758.5453);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+fragment float4 fs_mist(WorldOut in [[stage_in]], constant FrameU &F [[buffer(1)]], constant DrawU &D [[buffer(2)]]) {
+    float t = F.fog.z;
+    float2 p = in.w.xz * 0.08 + float2(t * 0.012, t * 0.008);
+    float v = vnoise(p) * 0.6 + vnoise(p * 2.3 + 4.0) * 0.3 + vnoise(p * 5.1 - t * 0.02) * 0.1;
+    float edge = ss(0.5, 0.2, length(in.uv - 0.5));
+    float a = ss(0.35, 0.8, v) * edge * D.color.a;
+    return float4(srgbOETF(F.fogColor.rgb), a);
+}
+
+fragment float4 fs_beam(WorldOut in [[stage_in]], constant DrawU &D [[buffer(2)]]) {
+    float k = D.params.w;
+    float a = (1.0 - in.uv.y) * ss(0.0, 0.05, in.uv.y) * k;
+    a *= 0.55 + 0.45 * sin(in.uv.x * 6.2831 * 3.0);
+    // the original writes this colour without colour space conversion
+    return float4(D.color.rgb, a * 0.6);
+}
+
+// ───────────────────────── sky ─────────────────────────
+
+struct SkyOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex SkyOut vs_sky(uint vid [[vertex_id]]) {
+    const float2 p[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    SkyOut o;
+    o.position = float4(p[vid], 0.0, 1.0);
+    o.uv = p[vid] * 0.5 + 0.5;
+    return o;
+}
+
+inline float skyHash(float2 p) { return fractf(sin(dot(p, float2(12.9898, 78.233))) * 43758.5453); }
+inline float h1(float n) { return fractf(sin(n * 91.3458) * 47453.5453); }
+
+inline float skyline(float x, float seed) {
+    float cx = x * 7.0 + seed * 31.0;
+    float cell = floor(cx);
+    float f = fract(cx);
+    float present = step(0.32, h1(cell + seed));
+    float w = 0.25 + 0.5 * h1(cell * 1.31 + seed);
+    float inside = step(abs(f - 0.5), w * 0.5);
+    float h = (0.03 + 0.11 * h1(cell * 2.17 + seed)) * present * inside;
+    float dr = w * 0.5;
+    float dome = step(0.55, h1(cell * 3.7 + seed)) * present * sqrt(max(0.0, dr * dr - (f - 0.5) * (f - 0.5))) / 7.0 * 1.6;
+    float spire = step(0.8, h1(cell * 5.3 + seed)) * present * max(0.0, 0.03 - abs(f - 0.5) * 0.4) * 2.0;
+    return h + (h > 0.0 ? dome + spire : 0.0);
+}
+
+fragment float4 fs_sky(SkyOut in [[stage_in]], constant FrameU &F [[buffer(1)]]) {
+    float2 uv = in.uv;
+    float aspect = F.skyParams.x, bright = F.skyParams.y, shift = F.skyParams.z, lift = F.skyParams.w;
+    float t = ss(0.0, 1.0, uv.y);
+    float3 c = mix(F.skyBottom.rgb, F.skyTop.rgb, t * t * (3.0 - 2.0 * t));
+    float2 p = float2((uv.x - 0.5) * aspect, uv.y - 0.42);
+    float g = exp(-dot(p, p) * 2.4);
+    c = mix(c, F.skyGlow.rgb, g * (0.55 + bright * 0.45));
+    for (int i = 0; i < 2; i++) {
+        float fi = float(i);
+        float par = 0.35 + fi * 0.3;
+        float x = (uv.x - 0.5) * aspect * (0.9 - fi * 0.25) + shift * par;
+        float base = 0.1 - lift * par + fi * 0.06;
+        float hgt = skyline(x, 3.0 + fi * 7.0);
+        float m = ss(0.0015, 0.0, (uv.y - base) - hgt) * step(0.0, hgt);
+        float below = ss(base + 0.02, base - 0.12, uv.y);
+        float3 sc = mix(F.skyTop.rgb, F.skyBottom.rgb, 0.55 + fi * 0.2);
+        c = mix(c, sc, max(m, below * step(0.0, 1.0)) * (0.22 - fi * 0.08));
+    }
+    // stars for the night chapters (skyGlow.w): sparse, softly twinkling, drifting with the turning world
+    float starAmt = F.skyGlow.w;
+    if (starAmt > 0.001) {
+        for (int k = 0; k < 2; k++) {
+            float fk = float(k);
+            float2 sg = float2((uv.x - 0.5) * aspect + shift * (0.6 + fk * 0.3), uv.y) * (70.0 + fk * 46.0);
+            float2 cell = floor(sg);
+            float2 fr = fract(sg);
+            float hs = skyHash(cell + fk * 17.0);
+            float2 ctr = float2(0.2 + 0.6 * skyHash(cell + 3.1 + fk), 0.2 + 0.6 * skyHash(cell + 7.7 + fk));
+            float2 dd = abs(fr - ctr);
+            float core = ss(0.075 - fk * 0.02, 0.0, dd.x + dd.y);
+            float tw = 0.65 + 0.35 * sin(F.fog.z * (0.6 + hs * 2.2) + hs * 50.0);
+            float s = step(0.9 + fk * 0.02, hs) * core * tw * (0.35 + 0.65 * ss(0.1, 0.8, uv.y));
+            c = mix(c, float3(1.0), clamp(s * starAmt * (1.0 - fk * 0.35), 0.0, 1.0));
+        }
+    }
+    c += (skyHash(uv * float2(1920.0, 1080.0) + fract(F.fog.z)) - 0.5) / 255.0 * 1.5;
+    return float4(srgbOETF(c), 1.0);
+}
+
+// ───────────────────────── debug lines ─────────────────────────
+
+struct LineIn {
+    packed_float3 position;
+    packed_float3 color;
+};
+
+struct LineOut {
+    float4 position [[position]];
+    float3 color;
+    float size [[point_size]];
+};
+
+vertex LineOut vs_line(uint vid [[vertex_id]], const device LineIn *v [[buffer(0)]], constant FrameU &F [[buffer(1)]], constant DrawU &D [[buffer(2)]]) {
+    LineOut o;
+    o.position = F.viewProj * float4(float3(v[vid].position), 1.0);
+    o.color = float3(v[vid].color);
+    o.size = D.params.z * F.viewport.z;
+    return o;
+}
+
+fragment float4 fs_line(LineOut in [[stage_in]], constant DrawU &D [[buffer(2)]]) {
+    return float4(srgbOETF(in.color), D.color.a);
+}

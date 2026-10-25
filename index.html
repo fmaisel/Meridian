@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Meridian</title>
+    <meta name="description" content="A quiet geometry — a perspective architecture puzzle." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;1,300;1,400&family=Jost:wght@300;400&display=swap" rel="stylesheet" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M32 6 54 19v26L32 58 10 45V19z' fill='%23f1e7d7'/%3E%3Cpath d='M32 32 54 19v26L32 58z' fill='%23ea7f69'/%3E%3Cpath d='M32 32 10 19v26l22 13z' fill='%23f2b48f'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="view"></canvas>
+
+      <div id="vignette"></div>
+
+      <!-- Title -->
+      <section id="title" class="screen">
+        <div class="title-inner">
+          <h1 class="logo" aria-label="Meridian"><span>M</span><span>E</span><span>R</span><span>I</span><span>D</span><span>I</span><span>A</span><span>N</span></h1>
+          <p class="subtitle">a quiet geometry</p>
+          <nav class="menu">
+            <button id="btn-continue" class="link" hidden>Continue</button>
+            <button id="btn-begin" class="link">Begin</button>
+            <button id="btn-settings-title" class="link small">Settings</button>
+          </nav>
+        </div>
+        <p class="footnote">click to walk &nbsp;·&nbsp; drag the handles &nbsp;·&nbsp; headphones recommended</p>
+      </section>
+
+      <!-- HUD -->
+      <section id="hud" hidden>
+        <button id="btn-pause" class="ring-btn" aria-label="Pause"><span></span></button>
+        <div id="chapter" aria-live="polite"><span class="num"></span><span class="name"></span></div>
+        <div id="hint" aria-live="polite"></div>
+        <div id="turn-hint" hidden>
+          <div class="turn-arrows"><span class="arc left"></span><span class="eye"></span><span class="arc right"></span></div>
+          <p>drag the sky to turn the world &nbsp;·&nbsp; <kbd>Q</kbd> <kbd>E</kbd></p>
+        </div>
+        <div id="turn-buttons" hidden>
+          <button id="btn-turn-left" class="turn-btn" aria-label="Turn world left">&#x21BA;</button>
+          <button id="btn-turn-right" class="turn-btn" aria-label="Turn world right">&#x21BB;</button>
+        </div>
+      </section>
+
+      <!-- Pause -->
+      <section id="pause" class="screen panel-screen" hidden>
+        <div class="panel">
+          <h2>Paused</h2>
+          <button id="btn-resume" class="link">Resume</button>
+          <button id="btn-hint" class="link">Whisper a hint</button>
+          <button id="btn-settings" class="link">Settings</button>
+          <button id="btn-restart" class="link small">Restart the journey</button>
+          <button id="btn-totitle" class="link small">Return to title</button>
+        </div>
+      </section>
+
+      <!-- Settings -->
+      <section id="settings" class="screen panel-screen" hidden>
+        <div class="panel">
+          <h2>Settings</h2>
+          <label class="row"><span>Music</span><input id="vol-music" type="range" min="0" max="1" step="0.01" /></label>
+          <label class="row"><span>Sounds</span><input id="vol-sfx" type="range" min="0" max="1" step="0.01" /></label>
+          <label class="row"><span>Soft shadows</span><input id="opt-shadows" type="checkbox" /></label>
+          <label class="row"><span>Turn buttons</span><input id="opt-turnbtn" type="checkbox" /></label>
+          <button id="btn-settings-back" class="link">Back</button>
+        </div>
+      </section>
+
+      <!-- Confirm -->
+      <section id="confirm" class="screen panel-screen" hidden>
+        <div class="panel">
+          <h2 id="confirm-text">Start again?</h2>
+          <button id="btn-confirm-yes" class="link">Yes</button>
+          <button id="btn-confirm-no" class="link small">No</button>
+        </div>
+      </section>
+
+      <!-- Ending -->
+      <section id="ending" class="screen" hidden>
+        <div class="title-inner">
+          <h1 class="logo small-logo"><span>M</span><span>E</span><span>R</span><span>I</span><span>D</span><span>I</span><span>A</span><span>N</span></h1>
+          <p class="subtitle">the light has found its height</p>
+          <p class="credits">design · code · sound — made with care<br />thank you for walking</p>
+          <nav class="menu"><button id="btn-again" class="link">Walk again</button></nav>
+        </div>
+      </section>
+
+      <div id="fade"></div>
+      <div id="debug-panel" hidden></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
